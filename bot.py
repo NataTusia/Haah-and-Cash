@@ -45,12 +45,17 @@ def connect_to_db_with_retry():
             time.sleep(5)
             if i == 2: raise e
 
+# Функція для отримання Київського часу
+def get_kyiv_time():
+    # UTC + 2 години (або +3 влітку). Ставимо +2 для зими
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
+
 # --- 1. Логіка AI ---
 async def generate_ai_post(topic, context, platform, post_type=None):
     if platform == "tg":
         role_desc = "Ты опытный крипто-инвестор и ментор канала 'Хеш и Кэш'. Объясняешь сложное просто."
         reqs = "Стиль: обучающий, дружеский. Используй аналогии. Добавь 1-2 эмодзи. Без сложного форматирования."
-    else: # Instagram
+    else: 
         role_desc = "Ты SMM-менеджер популярного крипто-блога."
         if post_type == "Reels":
             reqs = "Напиши сценарий для Reels (кратко: текст на экране и описание). Стиль: динамичный, вирусный."
@@ -91,8 +96,8 @@ async def get_random_photo(keywords):
 
 # --- 3. Основна функція ---
 async def prepare_draft(source_type, manual_day=None, from_command=False):
-    # source_type: 'morning', 'day', 'evening' (для TG) або 'inst' (для Instagram)
-    day_now = manual_day if manual_day else datetime.datetime.now().day
+    # ВИПРАВЛЕННЯ ЧАСУ: Беремо день за Києвом, а не за сервером
+    day_now = manual_day if manual_day else get_kyiv_time().day
     
     try:
         conn = connect_to_db_with_retry()
@@ -113,7 +118,6 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                 text = await generate_ai_post(topic, short_context, platform)
                 caption = f"✈️ TG ({source_type.upper()} | День {day_now})\n\n{text}"
                 
-                # Кнопки для TG
                 builder = InlineKeyboardBuilder()
                 builder.row(types.InlineKeyboardButton(text="✅ Опубликовать", callback_data="confirm_publish"))
                 builder.row(
@@ -123,6 +127,10 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                 
                 if len(caption) > 1020: caption = caption[:1015] + "..."
                 await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
+            else:
+                # Якщо викликали командою, але пусто - скажемо про це
+                if from_command:
+                    await bot.send_message(ADMIN_ID, f"🤷‍♂️ На {source_type} (День {day_now}) в базі нічого немає.")
 
         # ЛОГІКА ДЛЯ INSTAGRAM
         elif source_type == 'inst':
@@ -136,13 +144,10 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
             if result:
                 topic, short_context, post_type, keywords = result
                 
-                # ВАЖЛИВО: Перевірка типу поста для фото
                 if post_type in ['Reels', 'Карусель']:
-                    # Ставимо заглушку для Reels/Каруселей
                     photo_url = "https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=1000&auto=format&fit=crop"
-                    caption_prefix = f"📹 INSTA {post_type.upper()} (ФОТО НЕ ШУКАЛИ)"
+                    caption_prefix = f"📹 INSTA {post_type.upper()} (ЗАГЛУШКА)"
                 else:
-                    # Якщо Single - шукаємо фото як зазвичай
                     photo_url = await get_random_photo(keywords)
                     caption_prefix = f"📸 INSTA SINGLE"
 
@@ -150,15 +155,15 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                 caption = f"{caption_prefix} (День {day_now})\n\n{text}"
                 
                 builder = InlineKeyboardBuilder()
-                # Для Інсти не робимо кнопку публікації в канал, бо це ручна робота
-                builder.row(
-                    types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{day_now}_inst_inst")
-                )
+                builder.row(types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{day_now}_inst_inst"))
                 if post_type == 'Single':
                      builder.add(types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{day_now}_inst_inst"))
 
                 if len(caption) > 1020: caption = caption[:1015] + "..."
                 await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
+            else:
+                if from_command:
+                    await bot.send_message(ADMIN_ID, f"🤷‍♂️ Для Instagram (День {day_now}) в базі нічого немає.")
 
         cursor.close()
         conn.close()
@@ -169,7 +174,12 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        await message.answer("👋 Bot Ready.\n/gen_morning\n/gen_day\n/gen_evening\n/gen_inst")
+        # Показуємо який день бачить бот
+        ua_time = get_kyiv_time()
+        await message.answer(
+            f"👋 Bot Online!\n📅 Сервер думає, що зараз: {ua_time.strftime('%d.%m %H:%M')}\n"
+            "👇 Тисни для тесту:\n/gen_morning\n/gen_day\n/gen_evening\n/gen_inst"
+        )
 
 @dp.message(Command("gen_morning"))
 async def cmd_gm(message: types.Message): await prepare_draft("morning", from_command=True)
@@ -186,20 +196,16 @@ async def cmd_gi(message: types.Message): await prepare_draft("inst", from_comma
 # --- Callbacks ---
 @dp.callback_query(F.data.startswith("photo_"))
 async def regen_photo(callback: types.CallbackQuery):
-    # data: photo_DAY_SLOT_PLATFORM
     parts = callback.data.split("_")
     day, slot, plat = int(parts[1]), parts[2], parts[3]
-    
     await callback.answer("🔄...")
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
-        
         if plat == 'tg':
             cursor.execute("SELECT photo_keywords FROM telegram_posts WHERE day_number=%s AND time_slot=%s", (day, slot))
         else:
             cursor.execute("SELECT photo_keywords FROM instagram_posts WHERE day_number=%s", (day,))
-            
         result = cursor.fetchone()
         if result:
             new_url = await get_random_photo(result[0])
@@ -212,12 +218,10 @@ async def regen_photo(callback: types.CallbackQuery):
 async def regen_text(callback: types.CallbackQuery):
     parts = callback.data.split("_")
     day, slot, plat = int(parts[1]), parts[2], parts[3]
-    
     await callback.answer("📝...")
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
-        
         if plat == 'tg':
             cursor.execute("SELECT topic, content FROM telegram_posts WHERE day_number=%s AND time_slot=%s", (day, slot))
             res = cursor.fetchone()
@@ -244,23 +248,37 @@ async def publish(callback: types.CallbackQuery):
     await bot.send_photo(CHANNEL_ID, callback.message.photo[-1].file_id, caption=clean_cap)
     await callback.message.edit_caption(caption=f"✅ POSTED\n\n{clean_cap}")
 
-# --- Main ---
-async def handle(request): return web.Response(text="Bot Running")
+# --- WEB SERVER (Для Uptime Robot) ---
+async def handle(request):
+    return web.Response(text="Bot is ALIVE")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    
+    # Запускаємо Web Server у фоні
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
     
+    # ВАЖЛИВО: Використовуємо порт з Render
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    # Scheduler
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(prepare_draft, 'cron', hour=9, minute=0, args=['morning'])
     scheduler.add_job(prepare_draft, 'cron', hour=14, minute=0, args=['day'])
     scheduler.add_job(prepare_draft, 'cron', hour=19, minute=0, args=['evening'])
-    scheduler.add_job(prepare_draft, 'cron', hour=12, minute=0, args=['inst']) # Інста о 12:00
+    scheduler.add_job(prepare_draft, 'cron', hour=12, minute=0, args=['inst'])
     scheduler.start()
+    
+    # Bot Start
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.send_message(ADMIN_ID, "🚀 Бот перезагружен и время синхронизировано!")
+    except: pass
     
     await dp.start_polling(bot)
 
