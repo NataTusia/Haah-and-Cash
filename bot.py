@@ -51,7 +51,7 @@ def get_kyiv_time():
 # --- 1. Логіка AI ---
 async def generate_ai_post(topic, context, platform, task_type="post", time_slot=None):
     CAPTION_LIMIT = 850
-    SCENARIO_LIMIT = 5000 
+    SCENARIO_LIMIT = 2000 
     
     if platform == "tg":
         role_desc = "Ты опытный крипто-инвестор и ментор канала 'Хеш и Кэш'."
