@@ -46,51 +46,54 @@ def connect_to_db_with_retry():
             if i == 2: raise e
 
 def get_kyiv_time():
-    # UTC + 2 (зима)
     return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
 
-# --- 1. Логіка AI (ОНОВЛЕНІ ЛІМІТИ) ---
-async def generate_ai_post(topic, context, platform, time_slot=None, post_type=None):
-    # Безпечний ліміт для Телеграм-капшн (1024 - заголовок)
-    SAFE_LIMIT = 850 
+# --- 1. Логіка AI (Розділена генерація) ---
+async def generate_ai_post(topic, context, platform, task_type="post", time_slot=None):
+    # task_type: "post" (опис під фото) або "scenario" (сценарій для слайдів)
+    
+    # Ліміти
+    CAPTION_LIMIT = 850  # Безпечний ліміт для Телеграм-підпису
+    SCENARIO_LIMIT = 5000 # Практично безліміт для тексту сценарію
     
     if platform == "tg":
-        role_desc = "Ты опытный крипто-инвестор и ментор канала 'Хеш и Кэш'. Объясняешь сложное просто."
-        
+        role_desc = "Ты опытный крипто-инвестор и ментор канала 'Хеш и Кэш'."
         if time_slot == "morning":
-            greeting_rule = "Начни пост с короткого, бодрого приветствия."
+            greeting = "Начни пост с короткого, бодрого приветствия."
         else:
-            greeting_rule = "СТРОГО ЗАПРЕЩЕНО использовать приветствия (Привет, Здравствуйте и т.д.). Сразу переходи к сути темы."
-
-        reqs = (
-            f"{greeting_rule} Стиль: обучающий, дружеский, но конкретный. "
-            "Используй аналогии. Добавь 1-2 эмодзи. Без сложного форматирования."
-        )
-        max_len = SAFE_LIMIT
+            greeting = "СТРОГО ЗАПРЕЩЕНО использовать приветствия. Сразу переходи к сути."
+        
+        reqs = f"{greeting} Стиль: обучающий, дружеский. Используй аналогии. Добавь 1-2 эмодзи."
+        max_len = CAPTION_LIMIT
 
     else: # Instagram
-        role_desc = "Ты SMM-менеджер популярного крипто-блога."
+        role_desc = "Ты SMM-менеджер и контент-мейкер популярного крипто-блога."
         
-        if post_type in ["Reels", "Карусель"]:
+        if task_type == "scenario":
+            # Генерація сценарію для слайдів (без лімітів)
             reqs = (
-                "Это пост для Reels или Карусели. Основной контент уже на видео/картинках. "
-                "Твоя задача: Написать ОЧЕНЬ КОРОТКОЕ и цепляющее описание (максимум 2-3 предложения), "
-                "которое мотивирует досмотреть видео или полистать карусель. Обязательно добавь Call to Action."
+                "Твоя задача — написать подробный СЦЕНАРИЙ для карусели (5-8 слайдов). "
+                "Распиши контент для каждого слайда отдельно (Слайд 1: Заголовок + Визуал, Слайд 2: Тезис и т.д.). "
+                "Пиши детально, чтобы дизайнер понял задачу. "
+                "В конце добавь идею для обложки."
             )
-            max_len = 400 # Для Reels ліміт і так маленький, тут все ок
+            max_len = SCENARIO_LIMIT
+        
         else:
+            # Генерація опису під пост (з лімітом)
             reqs = (
-                "Это одиночный пост с фото. Напиши полноценный, вовлекающий текст, который раскрывает тему. "
-                "Стиль: экспертный, но доступный."
+                "Твоя задача — написать вовлекающий ОПИСАНИЕ (Caption) под этот пост. "
+                "Это текст, который люди будут читать под картинками. "
+                "Он должен дополнять слайды, но не дублировать их слово в слово. "
+                "Обязательно добавь призыв к действию (сохранить, подписаться) и хештеги."
             )
-            # Тут зменшили з 950 до 850, щоб точно влазило в Телеграм прев'ю
-            max_len = SAFE_LIMIT
+            max_len = CAPTION_LIMIT
 
     prompt = (
         f"{role_desc} Напиши на языке: {TARGET_LANGUAGE}.\n"
         f"Тема: {topic}.\nКонтекст: {context}.\n"
         f"Требования: {reqs}\n"
-        f"ВАЖНО: Строгий лимит — {max_len} символов. Не превышай его."
+        f"ВАЖНО: Лимит символов — {max_len}."
     )
     
     try:
@@ -124,20 +127,17 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
         
-        # TELEGRAM
+        # --- TELEGRAM ---
         if source_type in ['morning', 'day', 'evening']:
             table_name = "telegram_posts"
-            platform = "tg"
-            cursor.execute(
-                f"SELECT topic, content, photo_keywords FROM {table_name} WHERE day_number = %s AND time_slot = %s", 
-                (day_now, source_type)
-            )
+            cursor.execute(f"SELECT topic, content, photo_keywords FROM {table_name} WHERE day_number = %s AND time_slot = %s", (day_now, source_type))
             result = cursor.fetchone()
+            
             if result:
                 topic, short_context, keywords = result
                 photo_url = await get_random_photo(keywords)
-                
-                text = await generate_ai_post(topic, short_context, platform, time_slot=source_type)
+                # Генеруємо пост
+                text = await generate_ai_post(topic, short_context, "tg", task_type="post", time_slot=source_type)
                 
                 caption = f"✈️ TG ({source_type.upper()} | День {day_now})\n\n{text}"
                 
@@ -145,47 +145,62 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                 builder.row(types.InlineKeyboardButton(text="✅ Опубликовать", callback_data="confirm_publish"))
                 builder.row(
                     types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{day_now}_{source_type}_tg"),
-                    types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{day_now}_{source_type}_tg")
+                    types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{day_now}_{source_type}_tg_post")
                 )
                 
-                # Обрізка на випадок, якщо AI все ж таки трохи перевищив ліміт
                 if len(caption) > 1024: caption = caption[:1020] + "..."
                 await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
-            else:
-                if from_command: await bot.send_message(ADMIN_ID, f"🤷‍♂️ TG: Пусто на {source_type} (День {day_now})")
+            elif from_command:
+                await bot.send_message(ADMIN_ID, f"🤷‍♂️ TG: Пусто на {source_type} (День {day_now})")
 
-        # INSTAGRAM
+        # --- INSTAGRAM (Оновлена логіка) ---
         elif source_type == 'inst':
             table_name = "instagram_posts"
-            platform = "inst"
-            cursor.execute(
-                f"SELECT topic, content, post_type, photo_keywords FROM {table_name} WHERE day_number = %s", 
-                (day_now,)
-            )
+            # Reels більше не шукаємо
+            cursor.execute(f"SELECT topic, content, post_type, photo_keywords FROM {table_name} WHERE day_number = %s AND post_type != 'Reels'", (day_now,))
             result = cursor.fetchone()
+            
             if result:
                 topic, short_context, post_type, keywords = result
                 
-                if post_type in ['Reels', 'Карусель']:
+                # 1. Готуємо ФОТО
+                if post_type == 'Карусель':
                     photo_url = "https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=1000&auto=format&fit=crop"
-                    caption_prefix = f"📹 INSTA {post_type.upper()} (ЗАГЛУШКА)"
+                    prefix = "📸 INSTA CAROUSEL"
                 else:
                     photo_url = await get_random_photo(keywords)
-                    caption_prefix = f"📸 INSTA SINGLE"
+                    prefix = "📸 INSTA SINGLE"
 
-                text = await generate_ai_post(topic, short_context, platform, post_type=post_type)
+                # 2. Генеруємо ОПИС (Caption) - ліміт 850
+                caption_text = await generate_ai_post(topic, short_context, "inst", task_type="post")
+                full_caption = f"{prefix} (День {day_now})\n\n{caption_text}"
                 
-                caption = f"{caption_prefix} (День {day_now})\n\n{text}"
-                
-                builder = InlineKeyboardBuilder()
-                builder.row(types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{day_now}_inst_inst"))
+                # Кнопки для фото (редагувати опис)
+                builder_cap = InlineKeyboardBuilder()
+                builder_cap.row(types.InlineKeyboardButton(text="📝 Переписать описание", callback_data=f"text_{day_now}_inst_inst_post"))
                 if post_type == 'Single':
-                     builder.add(types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{day_now}_inst_inst"))
+                     builder_cap.add(types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{day_now}_inst_inst"))
 
-                if len(caption) > 1024: caption = caption[:1020] + "..."
-                await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
-            else:
-                if from_command: await bot.send_message(ADMIN_ID, f"🤷‍♂️ Insta: Пусто (День {day_now})")
+                if len(full_caption) > 1024: full_caption = full_caption[:1020] + "..."
+                
+                # ВІДПРАВЛЯЄМО ФОТО + ОПИС
+                await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=full_caption, reply_markup=builder_cap.as_markup())
+
+                # 3. Якщо це КАРУСЕЛЬ -> Генеруємо окремий СЦЕНАРІЙ (Без лімітів)
+                if post_type == 'Карусель':
+                    scenario_text = await generate_ai_post(topic, short_context, "inst", task_type="scenario")
+                    
+                    header = f"🛠 <b>СЦЕНАРИЙ ДЛЯ ДИЗАЙНЕРА (День {day_now})</b>\n{'='*25}\n\n"
+                    full_msg = header + scenario_text
+                    
+                    builder_scen = InlineKeyboardBuilder()
+                    builder_scen.row(types.InlineKeyboardButton(text="🔄 Переписать сценарий", callback_data=f"text_{day_now}_inst_inst_scenario"))
+                    
+                    # Відправляємо текст окремим повідомленням
+                    await bot.send_message(chat_id=ADMIN_ID, text=full_msg, parse_mode="HTML", reply_markup=builder_scen.as_markup())
+
+            elif from_command:
+                await bot.send_message(ADMIN_ID, f"🤷‍♂️ Insta: Пусто (День {day_now})")
 
         cursor.close()
         conn.close()
@@ -198,7 +213,7 @@ async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
         ua_time = get_kyiv_time()
         await message.answer(
-            f"👋 Bot Updated (Safe Limits)!\n📅 Час (UA): {ua_time.strftime('%d.%m %H:%M')}\n"
+            f"👋 Bot Updated (No Reels, Split Scenarios)!\n📅 Час (UA): {ua_time.strftime('%d.%m %H:%M')}\n"
             "👇 Тест:\n/gen_morning\n/gen_day\n/gen_evening\n/gen_inst"
         )
 
@@ -223,10 +238,12 @@ async def regen_photo(callback: types.CallbackQuery):
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
+        
         if plat == 'tg':
             cursor.execute("SELECT photo_keywords FROM telegram_posts WHERE day_number=%s AND time_slot=%s", (day, slot))
-        else:
+        else: # inst (Single)
             cursor.execute("SELECT photo_keywords FROM instagram_posts WHERE day_number=%s", (day,))
+            
         result = cursor.fetchone()
         if result:
             new_url = await get_random_photo(result[0])
@@ -237,30 +254,47 @@ async def regen_photo(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("text_"))
 async def regen_text(callback: types.CallbackQuery):
+    # data format: text_DAY_SLOT_PLATFORM_TYPE
     parts = callback.data.split("_")
-    day, slot, plat = int(parts[1]), parts[2], parts[3]
-    await callback.answer("📝...")
+    day = int(parts[1])
+    slot = parts[2]
+    plat = parts[3]
+    task_type = parts[4] # "post" or "scenario"
+    
+    await callback.answer("📝 Думаю...")
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
+        
         if plat == 'tg':
             cursor.execute("SELECT topic, content FROM telegram_posts WHERE day_number=%s AND time_slot=%s", (day, slot))
             res = cursor.fetchone()
             if res:
-                # Передаємо slot як time_slot
-                new_text = await generate_ai_post(res[0], res[1], "tg", time_slot=slot)
+                new_text = await generate_ai_post(res[0], res[1], "tg", task_type="post", time_slot=slot)
                 new_cap = f"✈️ TG ({slot.upper()} | День {day})\n\n{new_text}"
-        else:
+                if len(new_cap) > 1024: new_cap = new_cap[:1020] + "..."
+                await callback.message.edit_caption(caption=new_cap, reply_markup=callback.message.reply_markup)
+        
+        else: # INSTAGRAM
             cursor.execute("SELECT topic, content, post_type FROM instagram_posts WHERE day_number=%s", (day,))
             res = cursor.fetchone()
             if res:
-                # Передаємо res[2] (post_type)
-                new_text = await generate_ai_post(res[0], res[1], "inst", post_type=res[2])
-                prefix = f"📹 INSTA {res[2]}" if res[2] in ['Reels', 'Карусель'] else "📸 INSTA SINGLE"
-                new_cap = f"{prefix} (День {day})\n\n{new_text}"
+                # Генеруємо текст залежно від типу (пост чи сценарій)
+                new_text = await generate_ai_post(res[0], res[1], "inst", task_type=task_type)
+                
+                if task_type == "post":
+                    # Це редагування підпису під фото
+                    prefix = "📸 INSTA SINGLE" if res[2] == 'Single' else "📸 INSTA CAROUSEL"
+                    new_cap = f"{prefix} (День {day})\n\n{new_text}"
+                    if len(new_cap) > 1024: new_cap = new_cap[:1020] + "..."
+                    await callback.message.edit_caption(caption=new_cap, reply_markup=callback.message.reply_markup)
+                
+                elif task_type == "scenario":
+                    # Це редагування текстового повідомлення зі сценарієм
+                    header = f"🛠 <b>СЦЕНАРИЙ ДЛЯ ДИЗАЙНЕРА (День {day})</b>\n{'='*25}\n\n"
+                    full_msg = header + new_text
+                    await callback.message.edit_text(text=full_msg, parse_mode="HTML", reply_markup=callback.message.reply_markup)
 
-        if len(new_cap) > 1024: new_cap = new_cap[:1020] + "..."
-        await callback.message.edit_caption(caption=new_cap, reply_markup=callback.message.reply_markup)
         conn.close()
     except Exception as e: await callback.message.answer(f"Error: {e}")
 
@@ -287,12 +321,4 @@ async def main():
     scheduler.add_job(prepare_draft, 'cron', hour=9, minute=0, args=['morning'])
     scheduler.add_job(prepare_draft, 'cron', hour=14, minute=0, args=['day'])
     scheduler.add_job(prepare_draft, 'cron', hour=19, minute=0, args=['evening'])
-    scheduler.add_job(prepare_draft, 'cron', hour=12, minute=0, args=['inst'])
-    scheduler.start()
-    
-    try: await bot.delete_webhook(drop_pending_updates=True)
-    except: pass
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    scheduler.add_
