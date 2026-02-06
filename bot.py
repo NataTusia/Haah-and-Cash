@@ -45,30 +45,52 @@ def connect_to_db_with_retry():
             time.sleep(5)
             if i == 2: raise e
 
-# Функція для отримання Київського часу
 def get_kyiv_time():
-    # UTC + 2 години (або +3 влітку). Ставимо +2 для зими
+    # UTC + 2 (зима)
     return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
 
-# --- 1. Логіка AI ---
-async def generate_ai_post(topic, context, platform, post_type=None):
+# --- 1. Логіка AI (ОНОВЛЕНІ ЛІМІТИ) ---
+async def generate_ai_post(topic, context, platform, time_slot=None, post_type=None):
+    # Безпечний ліміт для Телеграм-капшн (1024 - заголовок)
+    SAFE_LIMIT = 850 
+    
     if platform == "tg":
         role_desc = "Ты опытный крипто-инвестор и ментор канала 'Хеш и Кэш'. Объясняешь сложное просто."
-        reqs = "Стиль: обучающий, дружеский. Используй аналогии. Добавь 1-2 эмодзи. Без сложного форматирования."
-    else: 
-        role_desc = "Ты SMM-менеджер популярного крипто-блога."
-        if post_type == "Reels":
-            reqs = "Напиши сценарий для Reels (кратко: текст на экране и описание). Стиль: динамичный, вирусный."
-        elif post_type == "Карусель":
-            reqs = "Напиши структуру для Карусели (заголовки слайдов) и описание поста. Стиль: экспертный, структурированный."
+        
+        if time_slot == "morning":
+            greeting_rule = "Начни пост с короткого, бодрого приветствия."
         else:
-            reqs = "Напиши пост для Инстаграм. Стиль: вовлекающий. Добавь призыв к действию."
+            greeting_rule = "СТРОГО ЗАПРЕЩЕНО использовать приветствия (Привет, Здравствуйте и т.д.). Сразу переходи к сути темы."
+
+        reqs = (
+            f"{greeting_rule} Стиль: обучающий, дружеский, но конкретный. "
+            "Используй аналогии. Добавь 1-2 эмодзи. Без сложного форматирования."
+        )
+        max_len = SAFE_LIMIT
+
+    else: # Instagram
+        role_desc = "Ты SMM-менеджер популярного крипто-блога."
+        
+        if post_type in ["Reels", "Карусель"]:
+            reqs = (
+                "Это пост для Reels или Карусели. Основной контент уже на видео/картинках. "
+                "Твоя задача: Написать ОЧЕНЬ КОРОТКОЕ и цепляющее описание (максимум 2-3 предложения), "
+                "которое мотивирует досмотреть видео или полистать карусель. Обязательно добавь Call to Action."
+            )
+            max_len = 400 # Для Reels ліміт і так маленький, тут все ок
+        else:
+            reqs = (
+                "Это одиночный пост с фото. Напиши полноценный, вовлекающий текст, который раскрывает тему. "
+                "Стиль: экспертный, но доступный."
+            )
+            # Тут зменшили з 950 до 850, щоб точно влазило в Телеграм прев'ю
+            max_len = SAFE_LIMIT
 
     prompt = (
         f"{role_desc} Напиши на языке: {TARGET_LANGUAGE}.\n"
         f"Тема: {topic}.\nКонтекст: {context}.\n"
         f"Требования: {reqs}\n"
-        f"ВАЖНО: Максимум 950 символов."
+        f"ВАЖНО: Строгий лимит — {max_len} символов. Не превышай его."
     )
     
     try:
@@ -96,14 +118,13 @@ async def get_random_photo(keywords):
 
 # --- 3. Основна функція ---
 async def prepare_draft(source_type, manual_day=None, from_command=False):
-    # ВИПРАВЛЕННЯ ЧАСУ: Беремо день за Києвом, а не за сервером
     day_now = manual_day if manual_day else get_kyiv_time().day
     
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
         
-        # ЛОГІКА ДЛЯ TELEGRAM
+        # TELEGRAM
         if source_type in ['morning', 'day', 'evening']:
             table_name = "telegram_posts"
             platform = "tg"
@@ -115,7 +136,9 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
             if result:
                 topic, short_context, keywords = result
                 photo_url = await get_random_photo(keywords)
-                text = await generate_ai_post(topic, short_context, platform)
+                
+                text = await generate_ai_post(topic, short_context, platform, time_slot=source_type)
+                
                 caption = f"✈️ TG ({source_type.upper()} | День {day_now})\n\n{text}"
                 
                 builder = InlineKeyboardBuilder()
@@ -125,14 +148,13 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                     types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{day_now}_{source_type}_tg")
                 )
                 
-                if len(caption) > 1020: caption = caption[:1015] + "..."
+                # Обрізка на випадок, якщо AI все ж таки трохи перевищив ліміт
+                if len(caption) > 1024: caption = caption[:1020] + "..."
                 await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
             else:
-                # Якщо викликали командою, але пусто - скажемо про це
-                if from_command:
-                    await bot.send_message(ADMIN_ID, f"🤷‍♂️ На {source_type} (День {day_now}) в базі нічого немає.")
+                if from_command: await bot.send_message(ADMIN_ID, f"🤷‍♂️ TG: Пусто на {source_type} (День {day_now})")
 
-        # ЛОГІКА ДЛЯ INSTAGRAM
+        # INSTAGRAM
         elif source_type == 'inst':
             table_name = "instagram_posts"
             platform = "inst"
@@ -151,7 +173,8 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                     photo_url = await get_random_photo(keywords)
                     caption_prefix = f"📸 INSTA SINGLE"
 
-                text = await generate_ai_post(topic, short_context, platform, post_type)
+                text = await generate_ai_post(topic, short_context, platform, post_type=post_type)
+                
                 caption = f"{caption_prefix} (День {day_now})\n\n{text}"
                 
                 builder = InlineKeyboardBuilder()
@@ -159,11 +182,10 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                 if post_type == 'Single':
                      builder.add(types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{day_now}_inst_inst"))
 
-                if len(caption) > 1020: caption = caption[:1015] + "..."
+                if len(caption) > 1024: caption = caption[:1020] + "..."
                 await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
             else:
-                if from_command:
-                    await bot.send_message(ADMIN_ID, f"🤷‍♂️ Для Instagram (День {day_now}) в базі нічого немає.")
+                if from_command: await bot.send_message(ADMIN_ID, f"🤷‍♂️ Insta: Пусто (День {day_now})")
 
         cursor.close()
         conn.close()
@@ -174,11 +196,10 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        # Показуємо який день бачить бот
         ua_time = get_kyiv_time()
         await message.answer(
-            f"👋 Bot Online!\n📅 Сервер думає, що зараз: {ua_time.strftime('%d.%m %H:%M')}\n"
-            "👇 Тисни для тесту:\n/gen_morning\n/gen_day\n/gen_evening\n/gen_inst"
+            f"👋 Bot Updated (Safe Limits)!\n📅 Час (UA): {ua_time.strftime('%d.%m %H:%M')}\n"
+            "👇 Тест:\n/gen_morning\n/gen_day\n/gen_evening\n/gen_inst"
         )
 
 @dp.message(Command("gen_morning"))
@@ -226,17 +247,19 @@ async def regen_text(callback: types.CallbackQuery):
             cursor.execute("SELECT topic, content FROM telegram_posts WHERE day_number=%s AND time_slot=%s", (day, slot))
             res = cursor.fetchone()
             if res:
-                new_text = await generate_ai_post(res[0], res[1], "tg")
+                # Передаємо slot як time_slot
+                new_text = await generate_ai_post(res[0], res[1], "tg", time_slot=slot)
                 new_cap = f"✈️ TG ({slot.upper()} | День {day})\n\n{new_text}"
         else:
             cursor.execute("SELECT topic, content, post_type FROM instagram_posts WHERE day_number=%s", (day,))
             res = cursor.fetchone()
             if res:
-                new_text = await generate_ai_post(res[0], res[1], "inst", res[2])
+                # Передаємо res[2] (post_type)
+                new_text = await generate_ai_post(res[0], res[1], "inst", post_type=res[2])
                 prefix = f"📹 INSTA {res[2]}" if res[2] in ['Reels', 'Карусель'] else "📸 INSTA SINGLE"
                 new_cap = f"{prefix} (День {day})\n\n{new_text}"
 
-        if len(new_cap) > 1020: new_cap = new_cap[:1015] + "..."
+        if len(new_cap) > 1024: new_cap = new_cap[:1020] + "..."
         await callback.message.edit_caption(caption=new_cap, reply_markup=callback.message.reply_markup)
         conn.close()
     except Exception as e: await callback.message.answer(f"Error: {e}")
@@ -248,25 +271,18 @@ async def publish(callback: types.CallbackQuery):
     await bot.send_photo(CHANNEL_ID, callback.message.photo[-1].file_id, caption=clean_cap)
     await callback.message.edit_caption(caption=f"✅ POSTED\n\n{clean_cap}")
 
-# --- WEB SERVER (Для Uptime Robot) ---
-async def handle(request):
-    return web.Response(text="Bot is ALIVE")
+# --- WEB SERVER ---
+async def handle(request): return web.Response(text="Bot is ALIVE")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    
-    # Запускаємо Web Server у фоні
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # ВАЖЛИВО: Використовуємо порт з Render
     port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
     
-    # Scheduler
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(prepare_draft, 'cron', hour=9, minute=0, args=['morning'])
     scheduler.add_job(prepare_draft, 'cron', hour=14, minute=0, args=['day'])
@@ -274,12 +290,8 @@ async def main():
     scheduler.add_job(prepare_draft, 'cron', hour=12, minute=0, args=['inst'])
     scheduler.start()
     
-    # Bot Start
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.send_message(ADMIN_ID, "🚀 Бот перезагружен и время синхронизировано!")
+    try: await bot.delete_webhook(drop_pending_updates=True)
     except: pass
-    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
