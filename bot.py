@@ -29,7 +29,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 TARGET_LANGUAGE = "russian"
-ERROR_SIGNATURE = "\n\n📩 <b>Перешлите это сообщение программисту Нате, она знает что с этим делать и поможет вам исправить ошибку.</b>"
+ERROR_SIGNATURE = "\n\n📩 <b>Перешлите это сообщение программисту Нате.</b>"
 
 # --- Допоміжні функції ---
 def clean_text(text):
@@ -45,54 +45,70 @@ def connect_to_db_with_retry():
             time.sleep(5)
             if i == 2: raise e
 
-def get_kyiv_time():
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
+def get_kyiv_date():
+    """Повертає об'єкт DATE за Києвом"""
+    now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
+    return now.date()
 
-# --- 1. Логіка AI ---
+# --- 1. Логіка AI (З АВТО-КОРЕКЦІЄЮ) ---
 async def generate_ai_post(topic, context, platform, task_type="post", time_slot=None):
-    CAPTION_LIMIT = 850
-    SCENARIO_LIMIT = 2000 
+    # Встановлюємо жорсткі, але безпечні ліміти
+    # 950 - це щоб із заголовком (TG | 2026-02-05) точно влізло в 1024
+    MAX_CAPTION_LENGTH = 850 
     
     if platform == "tg":
         role_desc = "Ты опытный крипто-инвестор и ментор канала 'Хеш и Кэш'."
         if time_slot == "morning":
-            greeting = "Начни пост с короткого, бодрого приветствия."
+            greeting = "Начни с очень короткого приветствия."
         else:
-            greeting = "СТРОГО ЗАПРЕЩЕНО использовать приветствия. Сразу переходи к сути."
+            greeting = "БЕЗ ПРИВЕТСТВИЙ. Сразу к сути."
         
-        reqs = f"{greeting} Стиль: обучающий, дружеский. Используй аналогии. Добавь 1-2 эмодзи."
-        max_len = CAPTION_LIMIT
-
+        reqs = (
+            f"{greeting} Стиль: лаконичный, обучающий. "
+            "Максимум 2 абзаца. 1-2 эмодзи. "
+            "Пиши так, чтобы текст не нужно было сокращать."
+        )
     else: # Instagram
-        role_desc = "Ты SMM-менеджер и контент-мейкер популярного крипто-блога."
-        
+        role_desc = "Ты SMM-менеджер крипто-блога."
         if task_type == "scenario":
-            reqs = (
-                "Твоя задача — написать подробный СЦЕНАРИЙ для карусели (5-8 слайдов). "
-                "Распиши контент для каждого слайда отдельно (Слайд 1: Заголовок + Визуал, Слайд 2: Тезис и т.д.). "
-                "Пиши детально, чтобы дизайнер понял задачу. "
-                "В конце добавь идею для обложки."
-            )
-            max_len = SCENARIO_LIMIT
+            reqs = "Напиши подробный СЦЕНАРИЙ для карусели (5-7 слайдов). Детально распиши текст для каждого слайда."
         else:
             reqs = (
-                "Твоя задача — написать вовлекающий ОПИСАНИЕ (Caption) под этот пост. "
-                "Это текст, который люди будут читать под картинками. "
-                "Он должен дополнять слайды, но не дублировать их слово в слово. "
-                "Обязательно добавь призыв к действию (сохранить, подписаться) и хештеги."
+                "Напиши ОПИСАНИЕ (Caption) под пост. "
+                "Текст должен быть СЖАТЫМ и емким. Самая суть + призыв сохранить."
             )
-            max_len = CAPTION_LIMIT
 
+    # 1. Перша спроба генерації
     prompt = (
-        f"{role_desc} Напиши на языке: {TARGET_LANGUAGE}.\n"
+        f"{role_desc} Язык: {TARGET_LANGUAGE}.\n"
         f"Тема: {topic}.\nКонтекст: {context}.\n"
         f"Требования: {reqs}\n"
-        f"ВАЖНО: Лимит символов — {max_len}."
     )
     
+    # Для сценарію ліміт не важливий, там окреме повідомлення
+    if task_type == "scenario":
+        prompt += "Лимит: до 2000 символов."
+    else:
+        prompt += f"СТРОГИЙ ЛИМИТ: Не более {MAX_CAPTION_LENGTH} символов."
+
     try:
         response = model.generate_content(prompt)
-        return clean_text(response.text)
+        text = clean_text(response.text)
+        
+        # 2. АВТО-КОРЕКЦІЯ (Якщо ШІ написав забагато)
+        if task_type != "scenario" and len(text) > MAX_CAPTION_LENGTH:
+            logging.info(f"⚠️ Текст задовгий ({len(text)}). Скорочую автоматично...")
+            
+            shorten_prompt = (
+                f"Твой предыдущий текст получился слишком длинным ({len(text)} символов). "
+                f"Сократи его до {MAX_CAPTION_LENGTH} символов, сохранив главный смысл и призыв к действию. "
+                f"Текст для сокращения:\n{text}"
+            )
+            response_short = model.generate_content(shorten_prompt)
+            text = clean_text(response_short.text)
+            
+        return text
+
     except Exception as e:
         return f"ERROR_AI: {str(e)}"
 
@@ -114,8 +130,8 @@ async def get_random_photo(keywords):
     return "https://images.unsplash.com/photo-1518546305927-5a555bb7020d?q=80&w=1000&auto=format&fit=crop"
 
 # --- 3. Основна функція ---
-async def prepare_draft(source_type, manual_day=None, from_command=False):
-    day_now = manual_day if manual_day else get_kyiv_time().day
+async def prepare_draft(source_type, manual_date=None, from_command=False):
+    date_now = manual_date if manual_date else get_kyiv_date()
     
     try:
         conn = connect_to_db_with_retry()
@@ -124,33 +140,38 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
         # --- TELEGRAM ---
         if source_type in ['morning', 'day', 'evening']:
             table_name = "telegram_posts"
-            cursor.execute(f"SELECT topic, content, photo_keywords FROM {table_name} WHERE day_number = %s AND time_slot = %s", (day_now, source_type))
+            cursor.execute(f"SELECT topic, content, photo_keywords FROM {table_name} WHERE publish_date = %s AND time_slot = %s", (date_now, source_type))
             result = cursor.fetchone()
             
             if result:
                 topic, short_context, keywords = result
                 photo_url = await get_random_photo(keywords)
-                text = await generate_ai_post(topic, short_context, "tg", task_type="post", time_slot=source_type)
                 
-                caption = f"✈️ TG ({source_type.upper()} | День {day_now})\n\n{text}"
+                # Генеруємо текст (він вже буде нормальної довжини завдяки авто-корекції)
+                final_text = await generate_ai_post(topic, short_context, "tg", task_type="post", time_slot=source_type)
                 
+                caption_header = f"✈️ TG ({source_type.upper()} | {date_now})\n\n"
+                full_caption = caption_header + final_text
+                
+                # Страховка: якщо навіть після скорочення він > 1024 (малоймовірно, але можливо)
+                if len(full_caption) > 1024:
+                    full_caption = full_caption[:1020] + "..."
+
                 builder = InlineKeyboardBuilder()
                 builder.row(types.InlineKeyboardButton(text="✅ Опубликовать", callback_data="confirm_publish"))
                 builder.row(
-                    types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{day_now}_{source_type}_tg"),
-                    types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{day_now}_{source_type}_tg_post")
+                    types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{date_now}_{source_type}_tg"),
+                    types.InlineKeyboardButton(text="📝 Новый текст", callback_data=f"text_{date_now}_{source_type}_tg_post")
                 )
                 
-                if len(caption) > 1024: caption = caption[:1020] + "..."
-                await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=caption, reply_markup=builder.as_markup())
+                await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=full_caption, reply_markup=builder.as_markup())
             elif from_command:
-                await bot.send_message(ADMIN_ID, f"🤷‍♂️ TG: Пусто на {source_type} (День {day_now})")
+                await bot.send_message(ADMIN_ID, f"🤷‍♂️ TG: Пусто на {source_type} ({date_now})")
 
         # --- INSTAGRAM ---
         elif source_type == 'inst':
             table_name = "instagram_posts"
-            # Reels ігноруємо (але ми їх вже видалили з БД, це про всяк випадок)
-            cursor.execute(f"SELECT topic, content, post_type, photo_keywords FROM {table_name} WHERE day_number = %s AND post_type != 'Reels'", (day_now,))
+            cursor.execute(f"SELECT topic, content, post_type, photo_keywords FROM {table_name} WHERE publish_date = %s", (date_now,))
             result = cursor.fetchone()
             
             if result:
@@ -163,32 +184,34 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
                     photo_url = await get_random_photo(keywords)
                     prefix = "📸 INSTA SINGLE"
 
-                # ОПИС (Caption)
-                caption_text = await generate_ai_post(topic, short_context, "inst", task_type="post")
-                full_caption = f"{prefix} (День {day_now})\n\n{caption_text}"
+                # Генеруємо опис (авто-корекція включена)
+                final_caption = await generate_ai_post(topic, short_context, "inst", task_type="post")
                 
-                builder_cap = InlineKeyboardBuilder()
-                builder_cap.row(types.InlineKeyboardButton(text="📝 Переписать описание", callback_data=f"text_{day_now}_inst_inst_post"))
-                if post_type == 'Single':
-                     builder_cap.add(types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{day_now}_inst_inst"))
+                caption_header = f"{prefix} ({date_now})\n\n"
+                full_caption = caption_header + final_caption
+                
+                if len(full_caption) > 1024:
+                    full_caption = full_caption[:1020] + "..."
 
-                if len(full_caption) > 1024: full_caption = full_caption[:1020] + "..."
-                
+                builder_cap = InlineKeyboardBuilder()
+                builder_cap.row(types.InlineKeyboardButton(text="📝 Переписать описание", callback_data=f"text_{date_now}_inst_inst_post"))
+                if post_type == 'Single':
+                     builder_cap.add(types.InlineKeyboardButton(text="🖼 Новое фото", callback_data=f"photo_{date_now}_inst_inst"))
+
                 await bot.send_photo(chat_id=ADMIN_ID, photo=photo_url, caption=full_caption, reply_markup=builder_cap.as_markup())
 
-                # СЦЕНАРІЙ (Тільки для Каруселі)
                 if post_type == 'Карусель':
                     scenario_text = await generate_ai_post(topic, short_context, "inst", task_type="scenario")
-                    header = f"🛠 <b>СЦЕНАРИЙ ДЛЯ ДИЗАЙНЕРА (День {day_now})</b>\n{'='*25}\n\n"
+                    header = f"🛠 <b>СЦЕНАРИЙ ДЛЯ ДИЗАЙНЕРА ({date_now})</b>\n{'='*25}\n\n"
                     full_msg = header + scenario_text
                     
                     builder_scen = InlineKeyboardBuilder()
-                    builder_scen.row(types.InlineKeyboardButton(text="🔄 Переписать сценарий", callback_data=f"text_{day_now}_inst_inst_scenario"))
+                    builder_scen.row(types.InlineKeyboardButton(text="🔄 Переписать сценарий", callback_data=f"text_{date_now}_inst_inst_scenario"))
                     
                     await bot.send_message(chat_id=ADMIN_ID, text=full_msg, parse_mode="HTML", reply_markup=builder_scen.as_markup())
 
             elif from_command:
-                await bot.send_message(ADMIN_ID, f"🤷‍♂️ Insta: Пусто (День {day_now})")
+                await bot.send_message(ADMIN_ID, f"🤷‍♂️ Insta: Пусто ({date_now})")
 
         cursor.close()
         conn.close()
@@ -199,9 +222,9 @@ async def prepare_draft(source_type, manual_day=None, from_command=False):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
-        ua_time = get_kyiv_time()
+        ua_date = get_kyiv_date()
         await message.answer(
-            f"👋 Bot Online!\n📅 Час (UA): {ua_time.strftime('%d.%m %H:%M')}\n"
+            f"👋 Bot Updated (Auto-Correction)!\n📅 Сьогодні: {ua_date}\n"
             "👇 Тест:\n/gen_morning\n/gen_day\n/gen_evening\n/gen_inst"
         )
 
@@ -221,15 +244,15 @@ async def cmd_gi(message: types.Message): await prepare_draft("inst", from_comma
 @dp.callback_query(F.data.startswith("photo_"))
 async def regen_photo(callback: types.CallbackQuery):
     parts = callback.data.split("_")
-    day, slot, plat = int(parts[1]), parts[2], parts[3]
+    date_str, slot, plat = parts[1], parts[2], parts[3]
     await callback.answer("🔄...")
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
         if plat == 'tg':
-            cursor.execute("SELECT photo_keywords FROM telegram_posts WHERE day_number=%s AND time_slot=%s", (day, slot))
+            cursor.execute("SELECT photo_keywords FROM telegram_posts WHERE publish_date=%s AND time_slot=%s", (date_str, slot))
         else:
-            cursor.execute("SELECT photo_keywords FROM instagram_posts WHERE day_number=%s", (day,))
+            cursor.execute("SELECT photo_keywords FROM instagram_posts WHERE publish_date=%s", (date_str,))
         result = cursor.fetchone()
         if result:
             new_url = await get_random_photo(result[0])
@@ -241,40 +264,34 @@ async def regen_photo(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("text_"))
 async def regen_text(callback: types.CallbackQuery):
     parts = callback.data.split("_")
-    day = int(parts[1])
-    slot = parts[2]
-    plat = parts[3]
-    task_type = parts[4]
-    
-    await callback.answer("📝 Думаю...")
+    date_str, slot, plat, task_type = parts[1], parts[2], parts[3], parts[4]
+    await callback.answer("📝 Думаю (Авто-корекція)...")
     try:
         conn = connect_to_db_with_retry()
         cursor = conn.cursor()
         
         if plat == 'tg':
-            cursor.execute("SELECT topic, content FROM telegram_posts WHERE day_number=%s AND time_slot=%s", (day, slot))
+            cursor.execute("SELECT topic, content FROM telegram_posts WHERE publish_date=%s AND time_slot=%s", (date_str, slot))
             res = cursor.fetchone()
             if res:
-                new_text = await generate_ai_post(res[0], res[1], "tg", task_type="post", time_slot=slot)
-                new_cap = f"✈️ TG ({slot.upper()} | День {day})\n\n{new_text}"
-                if len(new_cap) > 1024: new_cap = new_cap[:1020] + "..."
+                final_text = await generate_ai_post(res[0], res[1], "tg", task_type="post", time_slot=slot)
+                new_cap = f"✈️ TG ({slot.upper()} | {date_str})\n\n{final_text}"
                 await callback.message.edit_caption(caption=new_cap, reply_markup=callback.message.reply_markup)
         
         else: # INSTAGRAM
-            cursor.execute("SELECT topic, content, post_type FROM instagram_posts WHERE day_number=%s", (day,))
+            cursor.execute("SELECT topic, content, post_type FROM instagram_posts WHERE publish_date=%s", (date_str,))
             res = cursor.fetchone()
             if res:
-                new_text = await generate_ai_post(res[0], res[1], "inst", task_type=task_type)
+                final_text = await generate_ai_post(res[0], res[1], "inst", task_type=task_type)
                 
                 if task_type == "post":
                     prefix = "📸 INSTA SINGLE" if res[2] == 'Single' else "📸 INSTA CAROUSEL"
-                    new_cap = f"{prefix} (День {day})\n\n{new_text}"
-                    if len(new_cap) > 1024: new_cap = new_cap[:1020] + "..."
+                    new_cap = f"{prefix} ({date_str})\n\n{final_text}"
                     await callback.message.edit_caption(caption=new_cap, reply_markup=callback.message.reply_markup)
                 
                 elif task_type == "scenario":
-                    header = f"🛠 <b>СЦЕНАРИЙ ДЛЯ ДИЗАЙНЕРА (День {day})</b>\n{'='*25}\n\n"
-                    full_msg = header + new_text
+                    header = f"🛠 <b>СЦЕНАРИЙ ДЛЯ ДИЗАЙНЕРА ({date_str})</b>\n{'='*25}\n\n"
+                    full_msg = header + final_text
                     await callback.message.edit_text(text=full_msg, parse_mode="HTML", reply_markup=callback.message.reply_markup)
 
         conn.close()
@@ -283,46 +300,34 @@ async def regen_text(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "confirm_publish")
 async def publish(callback: types.CallbackQuery):
     cap = callback.message.caption
-    clean_cap = cap.split("\n\n", 1)[1] if "\n\n" in cap else cap
+    if "TG (" in cap:
+        clean_cap = cap.split("\n\n", 1)[1] if "\n\n" in cap else cap
+    else:
+        clean_cap = cap
     await bot.send_photo(CHANNEL_ID, callback.message.photo[-1].file_id, caption=clean_cap)
     await callback.message.edit_caption(caption=f"✅ POSTED\n\n{clean_cap}")
 
-# --- WEB SERVER (FIXED) ---
-async def handle(request):
-    return web.Response(text="I am alive")
+# --- WEB SERVER ---
+async def handle(request): return web.Response(text="I am alive")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-
-    # 1. ЗАПУСК ВЕБ-СЕРВЕРА (Це має бути першим!)
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Отримуємо порт з оточення (для Render) або ставимо 10000 для локального тесту
     port = int(os.environ.get("PORT", 10000))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
     
-    # Запускаємо сервер на 0.0.0.0 (це критично важливо!)
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    
-    logging.info(f"✅ Web Server started on port {port}")
-
-    # 2. ЗАПУСК ПЛАНУВАЛЬНИКА
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(prepare_draft, 'cron', hour=9, minute=0, args=['morning'])
     scheduler.add_job(prepare_draft, 'cron', hour=14, minute=0, args=['day'])
     scheduler.add_job(prepare_draft, 'cron', hour=19, minute=0, args=['evening'])
-    scheduler.add_job(prepare_draft, 'cron', hour=12, minute=0, args=['inst'])
+    scheduler.add_job(prepare_draft, 'cron', hour=13, minute=50, args=['inst'])
     scheduler.start()
-
-    # 3. ЗАПУСК БОТА
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except:
-        pass
-        
+    
+    try: await bot.delete_webhook(drop_pending_updates=True)
+    except: pass
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
